@@ -1,0 +1,138 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    // Collection: users
+    // Fields: fullName, email, phone, role, churchId, branchId, departmentId, status, createdAt
+    //
+    // Collection: churches
+    // Fields: name, logo, hqAddress, foundedDate, status, createdAt
+    //
+    // Collection: branches
+    // Fields: churchId, name, branchCode, address, city, state, pastorName, status, createdAt
+    //
+    // Collection: departments
+    // Fields: branchId, churchId, name, headUserId, description, createdAt
+    //
+    // Collection: members
+    // Fields: churchId, branchId, departmentId, fullName, phone, email, gender, dateJoined, memberType, status, createdAt
+    //
+    // Collection: attendance
+    // Fields: memberId, churchId, branchId, departmentId, serviceType, attendanceDate, status, checkinTime
+    //
+    // Collection: reports
+    // Fields: churchId, branchId, totalMembers, totalStewards, totalAttendance, reportMonth, createdAt
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() &&
+        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'SUPER_ADMIN' ||
+         (request.auth.token.email == "kuteyioluwaloyevincent291@gmail.com" && request.auth.token.email_verified == true));
+    }
+
+    function isChurchAdmin(churchId) {
+      return isAuthenticated() &&
+        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'CHURCH_ADMIN' &&
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.churchId == churchId) || isAdmin();
+    }
+
+    function isBranchAdmin(branchId) {
+      let user = get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+      return isAuthenticated() &&
+        (user.role == 'BRANCH_ADMIN' && user.branchId == branchId) || isChurchAdmin(user.churchId);
+    }
+
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+    function isValidUser(data) {
+      return data.fullName is string && data.fullName.size() > 0 && data.fullName.size() < 100 &&
+             data.email is string && data.email.size() > 0 &&
+             data.role in ['SUPER_ADMIN', 'CHURCH_ADMIN', 'BRANCH_ADMIN', 'DEPT_HEAD', 'STEWARD'] &&
+             data.status in ['ACTIVE', 'INACTIVE'];
+    }
+
+    function isValidChurch(data) {
+      return data.name is string && data.name.size() > 0 && data.name.size() < 255 &&
+             data.status in ['ACTIVE', 'INACTIVE'];
+    }
+
+    function isValidBranch(data) {
+      return data.churchId is string && data.name is string && data.name.size() > 0 &&
+             data.status in ['ACTIVE', 'INACTIVE'];
+    }
+
+    function isValidMember(data) {
+      return data.churchId is string && data.branchId is string &&
+             data.fullName is string && data.fullName.size() > 0 &&
+             data.status in ['ACTIVE', 'INACTIVE'];
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /users/{userId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && isValidUser(request.resource.data) && (isOwner(userId) || isAdmin());
+      allow update: if isAuthenticated() && isValidUser(request.resource.data) && (isOwner(userId) || isAdmin());
+    }
+
+    match /churches/{churchId} {
+      allow read: if isAuthenticated();
+      allow create: if isAdmin();
+      allow update: if isChurchAdmin(churchId);
+    }
+
+    match /branches/{branchId} {
+      allow read: if isAuthenticated();
+      allow create: if isChurchAdmin(request.resource.data.churchId);
+      allow update: if isBranchAdmin(branchId);
+    }
+
+    match /departments/{departmentId} {
+      allow read: if isAuthenticated();
+      allow create: if isBranchAdmin(request.resource.data.branchId);
+      allow update: if isBranchAdmin(resource.data.branchId);
+    }
+
+    match /members/{memberId} {
+      allow read: if isAuthenticated();
+      allow create: if isBranchAdmin(request.resource.data.branchId);
+      allow update: if isBranchAdmin(resource.data.branchId);
+    }
+
+    match /attendance/{attendanceId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated(); // Simplified for MVP, should be restricted to workers
+      allow update: if isBranchAdmin(resource.data.branchId);
+    }
+
+    match /reports/{reportId} {
+      allow read: if isAuthenticated();
+      allow create: if isBranchAdmin(request.resource.data.branchId);
+      allow update: if isBranchAdmin(resource.data.branchId);
+    }
+  }
+}

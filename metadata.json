@@ -1,0 +1,5 @@
+{
+  "name": "Stewardly - Church CRM & Management System",
+  "description": "A production-grade multi-tenant Church Management CRM for tracking branches, departments, stewards, and attendance analytics.",
+  "requestFramePermissions": []
+}

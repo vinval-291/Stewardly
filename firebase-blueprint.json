@@ -1,0 +1,125 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "System user with role-based access control.",
+      "type": "object",
+      "properties": {
+        "fullName": { "type": "string" },
+        "email": { "type": "string", "format": "email" },
+        "phone": { "type": "string" },
+        "role": { "type": "string", "enum": ["SUPER_ADMIN", "CHURCH_ADMIN", "BRANCH_ADMIN", "DEPT_HEAD", "STEWARD"] },
+        "churchId": { "type": "string" },
+        "branchId": { "type": "string" },
+        "departmentId": { "type": "string" },
+        "status": { "type": "string", "enum": ["ACTIVE", "INACTIVE"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["fullName", "email", "role", "status"]
+    },
+    "Church": {
+      "title": "Church",
+      "description": "A church organization (multi-tenant).",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "logo": { "type": "string" },
+        "hqAddress": { "type": "string" },
+        "foundedDate": { "type": "string", "format": "date" },
+        "status": { "type": "string", "enum": ["ACTIVE", "INACTIVE"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "status"]
+    },
+    "Branch": {
+      "title": "Branch",
+      "description": "A branch or parish of a church.",
+      "type": "object",
+      "properties": {
+        "churchId": { "type": "string" },
+        "name": { "type": "string" },
+        "branchCode": { "type": "string" },
+        "address": { "type": "string" },
+        "city": { "type": "string" },
+        "state": { "type": "string" },
+        "pastorName": { "type": "string" },
+        "status": { "type": "string", "enum": ["ACTIVE", "INACTIVE"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["churchId", "name", "status"]
+    },
+    "Department": {
+      "title": "Department",
+      "description": "A department within a branch.",
+      "type": "object",
+      "properties": {
+        "branchId": { "type": "string" },
+        "churchId": { "type": "string" },
+        "name": { "type": "string" },
+        "headUserId": { "type": "string" },
+        "description": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["branchId", "churchId", "name"]
+    },
+    "Member": {
+      "title": "Member",
+      "description": "A member or steward of a church.",
+      "type": "object",
+      "properties": {
+        "churchId": { "type": "string" },
+        "branchId": { "type": "string" },
+        "departmentId": { "type": "string" },
+        "fullName": { "type": "string" },
+        "phone": { "type": "string" },
+        "email": { "type": "string", "format": "email" },
+        "gender": { "type": "string", "enum": ["MALE", "FEMALE"] },
+        "dateJoined": { "type": "string", "format": "date" },
+        "memberType": { "type": "string", "enum": ["MEMBER", "STEWARD", "LEADER"] },
+        "status": { "type": "string", "enum": ["ACTIVE", "INACTIVE"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["churchId", "branchId", "fullName", "status"]
+    },
+    "Attendance": {
+      "title": "Attendance",
+      "description": "Attendance record for a service or meeting.",
+      "type": "object",
+      "properties": {
+        "memberId": { "type": "string" },
+        "churchId": { "type": "string" },
+        "branchId": { "type": "string" },
+        "departmentId": { "type": "string" },
+        "serviceType": { "type": "string" },
+        "attendanceDate": { "type": "string", "format": "date" },
+        "status": { "type": "string", "enum": ["PRESENT", "ABSENT", "EXCUSED"] },
+        "checkinTime": { "type": "string", "format": "date-time" }
+      },
+      "required": ["memberId", "churchId", "branchId", "attendanceDate", "status"]
+    },
+    "Report": {
+      "title": "Report",
+      "description": "Aggregated report snapshot.",
+      "type": "object",
+      "properties": {
+        "churchId": { "type": "string" },
+        "branchId": { "type": "string" },
+        "totalMembers": { "type": "integer" },
+        "totalStewards": { "type": "integer" },
+        "totalAttendance": { "type": "integer" },
+        "reportMonth": { "type": "string", "format": "date" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["churchId", "reportMonth"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": { "schema": "User", "description": "User profiles and roles." },
+    "/churches/{churchId}": { "schema": "Church", "description": "Church organization details." },
+    "/branches/{branchId}": { "schema": "Branch", "description": "Branch/Parish details." },
+    "/departments/{departmentId}": { "schema": "Department", "description": "Department details." },
+    "/members/{memberId}": { "schema": "Member", "description": "Member and steward registry." },
+    "/attendance/{attendanceId}": { "schema": "Attendance", "description": "Attendance logs." },
+    "/reports/{reportId}": { "schema": "Report", "description": "Monthly report snapshots." }
+  }
+}

@@ -157,28 +157,40 @@ export default function App() {
   const [attendance, setAttendance] = useState<Attendance[]>([]);
 
   useEffect(() => {
+    console.log('Setting up auth listener...');
     const unsubscribe = onAuthStateChanged(auth, async (fUser) => {
+      console.log('Auth state changed:', fUser ? fUser.email : 'No user');
       setFirebaseUser(fUser);
       if (fUser) {
-        // Fetch or create user profile
-        const userDoc = await getDoc(doc(db, 'users', fUser.uid));
-        if (userDoc.exists()) {
-          setUser({ id: fUser.uid, ...userDoc.data() } as User);
-        } else {
-          // Create default user profile for first-time login
-          const newUser: Partial<User> = {
-            fullName: fUser.displayName || 'New User',
-            email: fUser.email || '',
-            role: fUser.email === 'kuteyioluwaloyevincent291@gmail.com' ? 'SUPER_ADMIN' : 'STEWARD',
-            status: 'ACTIVE',
-            createdAt: new Date().toISOString(),
-          };
-          await setDoc(doc(db, 'users', fUser.uid), newUser);
-          setUser({ id: fUser.uid, ...newUser } as User);
+        try {
+          // Fetch or create user profile
+          const userDoc = await getDoc(doc(db, 'users', fUser.uid));
+          if (userDoc.exists()) {
+            console.log('User profile found in Firestore');
+            setUser({ id: fUser.uid, ...userDoc.data() } as User);
+          } else {
+            console.log('Creating new user profile in Firestore');
+            // Create default user profile for first-time login
+            const newUser: Partial<User> = {
+              fullName: fUser.displayName || 'New User',
+              email: fUser.email || '',
+              role: fUser.email === 'kuteyioluwaloyevincent291@gmail.com' ? 'SUPER_ADMIN' : 'STEWARD',
+              status: 'ACTIVE',
+              createdAt: new Date().toISOString(),
+            };
+            await setDoc(doc(db, 'users', fUser.uid), newUser);
+            setUser({ id: fUser.uid, ...newUser } as User);
+          }
+        } catch (err) {
+          console.error('Error fetching/creating user profile:', err);
+          toast.error('Error loading user profile');
         }
       } else {
         setUser(null);
       }
+      setLoading(false);
+    }, (error) => {
+      console.error('Auth listener error:', error);
       setLoading(false);
     });
     return unsubscribe;
@@ -217,13 +229,24 @@ export default function App() {
   }, [user]);
 
   const signIn = async () => {
+    console.log('Sign-in initiated...');
     try {
       const provider = new GoogleAuthProvider();
-      await signInWithPopup(auth, provider);
+      // Ensure the provider is configured for the popup
+      provider.setCustomParameters({ prompt: 'select_account' });
+      
+      const result = await signInWithPopup(auth, provider);
+      console.log('Sign-in successful:', result.user.email);
       toast.success('Signed in successfully');
-    } catch (error) {
-      console.error(error);
-      toast.error('Failed to sign in');
+    } catch (error: any) {
+      console.error('Sign-in error details:', error);
+      if (error.code === 'auth/popup-blocked') {
+        toast.error('Sign-in popup was blocked by your browser. Please allow popups for this site and try again.');
+      } else if (error.code === 'auth/cancelled-popup-request') {
+        // Ignore user cancellation
+      } else {
+        toast.error(`Sign-in failed: ${error.message || 'Unknown error'}`);
+      }
     }
   };
 
@@ -253,7 +276,10 @@ export default function App() {
           <p className="mt-2 text-center text-gray-500 dark:text-gray-400">Enterprise Church CRM & Management</p>
           
           <button
-            onClick={signIn}
+            onClick={() => {
+              console.log('Sign-in button clicked');
+              signIn();
+            }}
             className="flex items-center justify-center w-full gap-3 px-6 py-4 mt-10 font-semibold text-white transition-all bg-blue-600 rounded-xl hover:bg-blue-700 active:scale-95"
           >
             <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" className="w-6 h-6" alt="Google" />
@@ -470,10 +496,11 @@ export default function App() {
   );
 
   return (
-    <div className="flex min-h-screen bg-gray-50 dark:bg-black font-sans">
-      <Toaster position="top-right" richColors />
-      
-      {/* Sidebar */}
+    <AuthContext.Provider value={{ user, firebaseUser, loading, signIn, logout }}>
+      <div className="flex min-h-screen bg-gray-50 dark:bg-black font-sans">
+        <Toaster position="top-right" richColors />
+        
+        {/* Sidebar */}
       <aside className={cn(
         "fixed inset-y-0 left-0 z-50 w-64 bg-white border-r border-gray-100 dark:bg-gray-900 dark:border-gray-800 transition-transform lg:relative lg:translate-x-0",
         !isSidebarOpen && "-translate-x-full"
@@ -745,5 +772,6 @@ export default function App() {
         </div>
       </main>
     </div>
+    </AuthContext.Provider>
   );
 }

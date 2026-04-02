@@ -39,7 +39,8 @@ service cloud.firestore {
 
     function isAdmin() {
       return isAuthenticated() &&
-        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'SUPER_ADMIN' ||
+        ((exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'SUPER_ADMIN') ||
          (request.auth.token.email == "kuteyioluwaloyevincent291@gmail.com" && request.auth.token.email_verified == true));
     }
 
@@ -70,7 +71,7 @@ service cloud.firestore {
       return data.fullName is string && data.fullName.size() > 0 && data.fullName.size() < 100 &&
              data.email is string && data.email.size() > 0 &&
              data.role in ['SUPER_ADMIN', 'CHURCH_ADMIN', 'BRANCH_ADMIN', 'DEPT_HEAD', 'STEWARD'] &&
-             data.status in ['ACTIVE', 'INACTIVE'];
+             data.status in ['ACTIVE', 'INACTIVE', 'PENDING'];
     }
 
     function isValidChurch(data) {

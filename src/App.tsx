@@ -13,7 +13,9 @@ import {
   onSnapshot, 
   doc, 
   getDoc,
+  getDocs,
   setDoc,
+  deleteDoc,
   serverTimestamp,
   orderBy,
   limit,
@@ -54,7 +56,7 @@ import {
   Pie,
   Cell
 } from 'recharts';
-import { motion, AnimatePresence } from 'framer-motion';
+import { motion, AnimatePresence } from 'motion/react';
 import { format, startOfMonth, endOfMonth, subMonths } from 'date-fns';
 import { Toaster, toast } from 'sonner';
 import { auth, db } from './firebase';
@@ -89,18 +91,37 @@ enum OperationType {
 }
 
 function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errorMessage = error instanceof Error ? error.message : String(error);
+  
   const errInfo = {
-    error: error instanceof Error ? error.message : String(error),
+    error: errorMessage,
+    operationType,
+    path,
     authInfo: {
       userId: auth.currentUser?.uid,
       email: auth.currentUser?.email,
-    },
-    operationType,
-    path
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo: auth.currentUser?.providerData.map(provider => ({
+        providerId: provider.providerId,
+        displayName: provider.displayName,
+        email: provider.email,
+        photoUrl: provider.photoURL
+      })) || []
+    }
   };
-  console.error('Firestore Error: ', JSON.stringify(errInfo));
-  toast.error(`Database error: ${errInfo.error}`);
-  throw new Error(JSON.stringify(errInfo));
+
+  console.error('Firestore Error:', errorMessage, operationType, path);
+  toast.error(`Database error: ${errorMessage}`);
+  
+  try {
+    // This should be safe as errInfo only contains primitives and simple arrays/objects
+    throw new Error(JSON.stringify(errInfo));
+  } catch (stringifyError) {
+    console.error('Failed to stringify error info:', stringifyError);
+    throw new Error(`Firestore Error [${operationType}] at [${path}]: ${errorMessage}`);
+  }
 }
 
 // --- Components ---
@@ -143,11 +164,45 @@ const StatCard = ({ label, value, trend, icon: Icon, color }: { label: string, v
 // --- Main App ---
 
 export default function App() {
+  console.log('App component rendering...');
   const [firebaseUser, setFirebaseUser] = useState<FirebaseUser | null>(null);
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('dashboard');
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [isCreateAdminModalOpen, setIsCreateAdminModalOpen] = useState(false);
+
+  // Global error handler
+  useEffect(() => {
+    const handleError = (event: ErrorEvent) => {
+      const errorMsg = event.message || 'Unknown error';
+      const errorObj = event.error ? (event.error.message || String(event.error)) : 'No error object';
+      console.error('Global Error Event:', errorMsg, errorObj);
+      toast.error(`Global Error: ${errorMsg}`);
+    };
+    window.addEventListener('error', handleError);
+    
+    const handleGlobalClick = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      let className = '';
+      if (target && target.className) {
+        if (typeof target.className === 'string') {
+          className = target.className;
+        } else if (typeof target.className === 'object' && 'baseVal' in target.className) {
+          // Handle SVGAnimatedString
+          className = (target.className as any).baseVal;
+        }
+      }
+      const targetInfo = target ? `${target.tagName}${target.id ? `#${target.id}` : ''}${className ? `.${className.split(' ').join('.')}` : ''}` : 'unknown';
+      console.log('Global click detected at:', e.clientX, e.clientY, 'Target:', targetInfo);
+    };
+    window.addEventListener('click', handleGlobalClick);
+
+    return () => {
+      window.removeEventListener('error', handleError);
+      window.removeEventListener('click', handleGlobalClick);
+    };
+  }, []);
 
   // Data States
   const [churches, setChurches] = useState<Church[]>([]);
@@ -155,6 +210,7 @@ export default function App() {
   const [departments, setDepartments] = useState<Department[]>([]);
   const [members, setMembers] = useState<Member[]>([]);
   const [attendance, setAttendance] = useState<Attendance[]>([]);
+  const [users, setUsers] = useState<User[]>([]);
 
   useEffect(() => {
     console.log('Setting up auth listener...');
@@ -163,34 +219,66 @@ export default function App() {
       setFirebaseUser(fUser);
       if (fUser) {
         try {
-          // Fetch or create user profile
+          // 1. Try to fetch user profile by UID
           const userDoc = await getDoc(doc(db, 'users', fUser.uid));
+          
           if (userDoc.exists()) {
-            console.log('User profile found in Firestore');
+            console.log('User profile found in Firestore by UID');
             setUser({ id: fUser.uid, ...userDoc.data() } as User);
           } else {
-            console.log('Creating new user profile in Firestore');
-            // Create default user profile for first-time login
-            const newUser: Partial<User> = {
-              fullName: fUser.displayName || 'New User',
-              email: fUser.email || '',
-              role: fUser.email === 'kuteyioluwaloyevincent291@gmail.com' ? 'SUPER_ADMIN' : 'STEWARD',
-              status: 'ACTIVE',
-              createdAt: new Date().toISOString(),
-            };
-            await setDoc(doc(db, 'users', fUser.uid), newUser);
-            setUser({ id: fUser.uid, ...newUser } as User);
+            // 2. If not found by UID, check if there's a pre-created profile by EMAIL
+            console.log('Checking for pre-created profile by email:', fUser.email);
+            const q = query(collection(db, 'users'), where('email', '==', fUser.email));
+            const querySnapshot = await getDocs(q);
+            
+            if (!querySnapshot.empty) {
+              const existingDoc = querySnapshot.docs[0];
+              const existingData = existingDoc.data() as Partial<User>;
+              console.log('Pre-created profile found by email, migrating to UID...');
+              
+              // Migrate the data to the new UID document
+              const updatedUser = {
+                ...existingData,
+                id: fUser.uid,
+                fullName: existingData.fullName || fUser.displayName || 'New User',
+                email: fUser.email || existingData.email || '',
+                role: existingData.role || 'STEWARD',
+                status: 'ACTIVE',
+                createdAt: existingData.createdAt || new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+              } as User;
+              
+              await setDoc(doc(db, 'users', fUser.uid), updatedUser);
+              
+              // Delete the old dummy document if it's not the same as UID
+              if (existingDoc.id !== fUser.uid) {
+                await deleteDoc(doc(db, 'users', existingDoc.id));
+              }
+              
+              setUser(updatedUser);
+            } else {
+              console.log('Creating brand new user profile in Firestore');
+              // 3. Create default user profile for first-time login
+              const newUser: Partial<User> = {
+                fullName: fUser.displayName || 'New User',
+                email: fUser.email || '',
+                role: fUser.email === 'kuteyioluwaloyevincent291@gmail.com' ? 'SUPER_ADMIN' : 'STEWARD',
+                status: 'ACTIVE',
+                createdAt: new Date().toISOString(),
+              };
+              await setDoc(doc(db, 'users', fUser.uid), newUser);
+              setUser({ id: fUser.uid, ...newUser } as User);
+            }
           }
-        } catch (err) {
-          console.error('Error fetching/creating user profile:', err);
-          toast.error('Error loading user profile');
+        } catch (err: any) {
+          handleFirestoreError(err, OperationType.GET, 'users');
         }
       } else {
         setUser(null);
       }
       setLoading(false);
     }, (error) => {
-      console.error('Auth listener error:', error);
+      console.error('Auth listener error:', error.message || error);
       setLoading(false);
     });
     return unsubscribe;
@@ -220,11 +308,17 @@ export default function App() {
       setMembers(s.docs.map(d => ({ id: d.id, ...d.data() } as Member)));
     }, (e) => handleFirestoreError(e, OperationType.LIST, 'members'));
 
+    const qUsers = query(collection(db, 'users'));
+    const unsubUsers = onSnapshot(qUsers, (s) => {
+      setUsers(s.docs.map(d => ({ id: d.id, ...d.data() } as User)));
+    }, (e) => handleFirestoreError(e, OperationType.LIST, 'users'));
+
     return () => {
       unsubChurches();
       unsubBranches();
       unsubDepts();
       unsubMembers();
+      unsubUsers();
     };
   }, [user]);
 
@@ -239,7 +333,7 @@ export default function App() {
       console.log('Sign-in successful:', result.user.email);
       toast.success('Signed in successfully');
     } catch (error: any) {
-      console.error('Sign-in error details:', error);
+      console.error('Sign-in error details:', error.code, error.message);
       if (error.code === 'auth/popup-blocked') {
         toast.error('Sign-in popup was blocked by your browser. Please allow popups for this site and try again.');
       } else if (error.code === 'auth/cancelled-popup-request') {
@@ -253,6 +347,97 @@ export default function App() {
   const logout = async () => {
     await signOut(auth);
     toast.success('Signed out');
+  };
+
+  const seedDemoData = async () => {
+    if (user?.role !== 'SUPER_ADMIN') {
+      toast.error('Only Super Admins can seed data');
+      return;
+    }
+
+    const loadingToast = toast.loading('Seeding demo data...');
+    try {
+      // 1. Create Church
+      const churchRef = await addDoc(collection(db, 'churches'), {
+        name: 'The Redeemed Christian Church of God',
+        hqAddress: 'Redemption Camp, Lagos-Ibadan Expressway',
+        status: 'ACTIVE',
+        createdAt: new Date().toISOString(),
+      });
+      const churchId = churchRef.id;
+
+      // 2. Create Branches
+      const branchData = [
+        { name: 'Lagos Province 1', city: 'Lagos', pastorName: 'Pastor Adeboye' },
+        { name: 'Abuja Central Parish', city: 'Abuja', pastorName: 'Pastor Osinbajo' },
+        { name: 'Port Harcourt Parish', city: 'PH', pastorName: 'Pastor Ibiyeomie' },
+      ];
+
+      const branchIds: string[] = [];
+      const deptIds: string[] = [];
+
+      for (const b of branchData) {
+        const branchRef = await addDoc(collection(db, 'branches'), {
+          ...b,
+          churchId,
+          status: 'ACTIVE',
+          createdAt: new Date().toISOString(),
+        });
+        const branchId = branchRef.id;
+        branchIds.push(branchId);
+
+        // 3. Create Departments for each branch
+        const depts = ['Choir', 'Media', 'Ushers', 'Stewards'];
+        for (const dName of depts) {
+          const deptRef = await addDoc(collection(db, 'departments'), {
+            name: dName,
+            branchId,
+            churchId,
+            createdAt: new Date().toISOString(),
+          });
+          const departmentId = deptRef.id;
+          deptIds.push(departmentId);
+
+          // 4. Create Members for each department
+          const memberCount = Math.floor(Math.random() * 5) + 3; // 3-7 members per dept
+          for (let i = 0; i < memberCount; i++) {
+            await addDoc(collection(db, 'members'), {
+              fullName: `${dName} Member ${i + 1} (${b.city})`,
+              churchId,
+              branchId,
+              departmentId,
+              gender: i % 2 === 0 ? 'MALE' : 'FEMALE',
+              memberType: i === 0 ? 'LEADER' : (i < 3 ? 'STEWARD' : 'MEMBER'),
+              status: 'ACTIVE',
+              createdAt: new Date().toISOString(),
+            });
+          }
+        }
+      }
+
+      toast.dismiss(loadingToast);
+      // 5. Create Dummy Admin Accounts
+      const dummyAdmins = [
+        { fullName: 'Church Owner', role: 'CHURCH_ADMIN', churchId: churchId, email: 'owner@church.com' },
+        { fullName: 'Lagos Branch Leader', role: 'BRANCH_ADMIN', churchId: churchId, branchId: branchIds[0], email: 'lagos@church.com' },
+        { fullName: 'Abuja Branch Leader', role: 'BRANCH_ADMIN', churchId: churchId, branchId: branchIds[1], email: 'abuja@church.com' },
+        { fullName: 'Lagos Choir Head', role: 'DEPT_HEAD', churchId: churchId, branchId: branchIds[0], departmentId: deptIds[0], email: 'choir.lagos@church.com' },
+      ];
+
+      for (const admin of dummyAdmins) {
+        await setDoc(doc(db, 'users', `dummy_${admin.role}_${Math.random().toString(36).substr(2, 5)}`), {
+          ...admin,
+          status: 'ACTIVE',
+          createdAt: new Date().toISOString()
+        });
+      }
+
+      toast.success('Demo data seeded successfully with admin accounts!');
+    } catch (error) {
+      console.error('Error seeding data:', error);
+      toast.dismiss(loadingToast);
+      toast.error('Failed to seed data');
+    }
   };
 
   if (loading) {
@@ -278,12 +463,23 @@ export default function App() {
           <button
             onClick={() => {
               console.log('Sign-in button clicked');
+              toast.info('Sign-in button clicked, initiating auth...');
               signIn();
             }}
-            className="flex items-center justify-center w-full gap-3 px-6 py-4 mt-10 font-semibold text-white transition-all bg-blue-600 rounded-xl hover:bg-blue-700 active:scale-95"
+            className="flex items-center justify-center w-full gap-3 px-6 py-4 mt-10 font-semibold text-white transition-all bg-blue-600 rounded-xl hover:bg-blue-700 active:scale-95 relative z-10"
           >
             <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" className="w-6 h-6" alt="Google" />
             Sign in with Google
+          </button>
+          
+          <button
+            onClick={() => {
+              console.log('Test Button clicked');
+              toast.info('Test Button clicked successfully!');
+            }}
+            className="w-full mt-4 p-4 bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 rounded-xl border border-dashed border-gray-300 dark:border-gray-700 hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors relative z-10"
+          >
+            Test Button (Check if buttons work)
           </button>
           
           <p className="mt-8 text-xs text-center text-gray-400">
@@ -295,6 +491,22 @@ export default function App() {
   }
 
   const renderDashboard = () => {
+    // Filter data based on role
+    const filteredMembers = members.filter(m => {
+      if (user?.role === 'SUPER_ADMIN') return true;
+      if (user?.role === 'CHURCH_ADMIN') return m.churchId === user.churchId;
+      if (user?.role === 'BRANCH_ADMIN') return m.branchId === user.branchId;
+      if (user?.role === 'DEPT_HEAD') return m.departmentId === user.departmentId;
+      return false;
+    });
+
+    const filteredBranches = branches.filter(b => {
+      if (user?.role === 'SUPER_ADMIN') return true;
+      if (user?.role === 'CHURCH_ADMIN') return b.churchId === user.churchId;
+      if (user?.role === 'BRANCH_ADMIN') return b.id === user.branchId;
+      return false;
+    });
+
     const data = [
       { name: 'Week 1', attendance: 420 },
       { name: 'Week 2', attendance: 450 },
@@ -331,9 +543,9 @@ export default function App() {
         </div>
 
         <div className="grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-4">
-          <StatCard label="Total Members" value={members.length} trend="+12% from last month" icon={Users} color="bg-blue-500" />
-          <StatCard label="Total Branches" value={branches.length} icon={MapPin} color="bg-emerald-500" />
-          <StatCard label="Active Stewards" value={members.filter(m => m.memberType === 'STEWARD').length} trend="+5% this week" icon={UserCheck} color="bg-amber-500" />
+          <StatCard label="Total Members" value={filteredMembers.length} trend="+12% from last month" icon={Users} color="bg-blue-500" />
+          <StatCard label="Total Branches" value={filteredBranches.length} icon={MapPin} color="bg-emerald-500" />
+          <StatCard label="Active Stewards" value={filteredMembers.filter(m => m.memberType === 'STEWARD').length} trend="+5% this week" icon={UserCheck} color="bg-amber-500" />
           <StatCard label="Avg Attendance" value="465" trend="+8% vs last month" icon={CalendarIcon} color="bg-indigo-500" />
         </div>
 
@@ -394,106 +606,327 @@ export default function App() {
     );
   };
 
-  const renderMembers = () => (
-    <div className="space-y-8">
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-3xl font-bold text-gray-900 dark:text-white">Members</h2>
-          <p className="text-gray-500 dark:text-gray-400">Manage your church population and stewards</p>
-        </div>
-        <button 
-          onClick={async () => {
-            const name = prompt('Full Name:');
-            if (name) {
-              await addDoc(collection(db, 'members'), {
-                fullName: name,
-                churchId: user.churchId || 'default',
-                branchId: user.branchId || 'default',
-                memberType: 'MEMBER',
-                status: 'ACTIVE',
-                gender: 'MALE',
-                createdAt: new Date().toISOString()
-              });
-              toast.success('Member added');
-            }
-          }}
-          className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700"
-        >
-          <Plus className="w-4 h-4" />
-          Add Member
-        </button>
-      </div>
+  const renderMembers = () => {
+    const filteredMembers = members.filter(m => {
+      if (user?.role === 'SUPER_ADMIN') return true;
+      if (user?.role === 'CHURCH_ADMIN') return m.churchId === user.churchId;
+      if (user?.role === 'BRANCH_ADMIN') return m.branchId === user.branchId;
+      if (user?.role === 'DEPT_HEAD') return m.departmentId === user.departmentId;
+      return false;
+    });
 
-      <div className="p-6 bg-white border border-gray-100 rounded-2xl dark:bg-gray-900 dark:border-gray-800">
-        <div className="flex flex-col gap-4 mb-6 md:flex-row md:items-center">
-          <div className="relative flex-1">
-            <Search className="absolute w-4 h-4 text-gray-400 -translate-y-1/2 left-3 top-1/2" />
-            <input 
-              type="text" 
-              placeholder="Search members..." 
-              className="w-full py-2 pl-10 pr-4 text-sm bg-gray-50 border border-gray-200 rounded-lg dark:bg-gray-800 dark:border-gray-700 dark:text-white focus:ring-2 focus:ring-blue-500 outline-none"
-            />
+    return (
+      <div className="space-y-8">
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-3xl font-bold text-gray-900 dark:text-white">Members</h2>
+            <p className="text-gray-500 dark:text-gray-400">Manage your church population and stewards</p>
           </div>
-          <div className="flex gap-2">
-            <button className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-200 rounded-lg dark:bg-gray-900 dark:border-gray-800 dark:text-gray-300 hover:bg-gray-50">
-              <Filter className="w-4 h-4" />
-              Filters
-            </button>
-          </div>
+          <button 
+            onClick={async () => {
+              const name = prompt('Full Name:');
+              if (name) {
+                await addDoc(collection(db, 'members'), {
+                  fullName: name,
+                  churchId: user?.churchId || 'default',
+                  branchId: user?.branchId || 'default',
+                  departmentId: user?.departmentId || '',
+                  memberType: 'MEMBER',
+                  status: 'ACTIVE',
+                  gender: 'MALE',
+                  createdAt: new Date().toISOString()
+                });
+                toast.success('Member added');
+              }
+            }}
+            className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700"
+          >
+            <Plus className="w-4 h-4" />
+            Add Member
+          </button>
         </div>
 
-        <div className="overflow-x-auto">
-          <table className="w-full text-left">
-            <thead>
-              <tr className="border-b border-gray-100 dark:border-gray-800">
-                <th className="pb-4 text-xs font-semibold text-gray-500 uppercase">Name</th>
-                <th className="pb-4 text-xs font-semibold text-gray-500 uppercase">Type</th>
-                <th className="pb-4 text-xs font-semibold text-gray-500 uppercase">Branch</th>
-                <th className="pb-4 text-xs font-semibold text-gray-500 uppercase">Status</th>
-                <th className="pb-4 text-xs font-semibold text-gray-500 uppercase text-right">Actions</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-gray-100 dark:divide-gray-800">
-              {members.map((member) => (
-                <tr key={member.id} className="group hover:bg-gray-50 dark:hover:bg-gray-800/50">
-                  <td className="py-4">
-                    <div className="flex items-center gap-3">
-                      <div className="flex items-center justify-center w-8 h-8 font-bold text-blue-600 bg-blue-100 rounded-full dark:bg-blue-900/30">
-                        {member.fullName[0]}
-                      </div>
-                      <span className="font-medium text-gray-900 dark:text-white">{member.fullName}</span>
-                    </div>
-                  </td>
-                  <td className="py-4">
-                    <span className={cn(
-                      "px-2 py-1 text-xs font-medium rounded-full",
-                      member.memberType === 'STEWARD' ? "bg-amber-100 text-amber-700" : "bg-blue-100 text-blue-700"
-                    )}>
-                      {member.memberType}
-                    </span>
-                  </td>
-                  <td className="py-4 text-sm text-gray-600 dark:text-gray-400">
-                    {branches.find(b => b.id === member.branchId)?.name || 'Main'}
-                  </td>
-                  <td className="py-4">
-                    <span className="flex items-center gap-1.5 text-xs font-medium text-green-600">
-                      <div className="w-1.5 h-1.5 rounded-full bg-green-600"></div>
-                      {member.status}
-                    </span>
-                  </td>
-                  <td className="py-4 text-right">
-                    <button className="p-2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200">
-                      <MoreVertical className="w-4 h-4" />
-                    </button>
-                  </td>
+        <div className="p-6 bg-white border border-gray-100 rounded-2xl dark:bg-gray-900 dark:border-gray-800">
+          <div className="flex flex-col gap-4 mb-6 md:flex-row md:items-center">
+            <div className="relative flex-1">
+              <Search className="absolute w-4 h-4 text-gray-400 -translate-y-1/2 left-3 top-1/2" />
+              <input 
+                type="text" 
+                placeholder="Search members..." 
+                className="w-full py-2 pl-10 pr-4 text-sm bg-gray-50 border border-gray-200 rounded-lg dark:bg-gray-800 dark:border-gray-700 dark:text-white focus:ring-2 focus:ring-blue-500 outline-none"
+              />
+            </div>
+            <div className="flex gap-2">
+              <button className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-200 rounded-lg dark:bg-gray-900 dark:border-gray-800 dark:text-gray-300 hover:bg-gray-50">
+                <Filter className="w-4 h-4" />
+                Filters
+              </button>
+            </div>
+          </div>
+
+          <div className="overflow-x-auto">
+            <table className="w-full text-left">
+              <thead>
+                <tr className="border-b border-gray-100 dark:border-gray-800">
+                  <th className="pb-4 text-xs font-semibold text-gray-500 uppercase">Name</th>
+                  <th className="pb-4 text-xs font-semibold text-gray-500 uppercase">Type</th>
+                  <th className="pb-4 text-xs font-semibold text-gray-500 uppercase">Branch</th>
+                  <th className="pb-4 text-xs font-semibold text-gray-500 uppercase">Status</th>
+                  <th className="pb-4 text-xs font-semibold text-gray-500 uppercase text-right">Actions</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody className="divide-y divide-gray-100 dark:divide-gray-800">
+                {filteredMembers.map((member) => (
+                  <tr key={member.id} className="group hover:bg-gray-50 dark:hover:bg-gray-800/50">
+                    <td className="py-4">
+                      <div className="flex items-center gap-3">
+                        <div className="flex items-center justify-center w-8 h-8 font-bold text-blue-600 bg-blue-100 rounded-full dark:bg-blue-900/30">
+                          {member.fullName[0]}
+                        </div>
+                        <span className="font-medium text-gray-900 dark:text-white">{member.fullName}</span>
+                      </div>
+                    </td>
+                    <td className="py-4">
+                      <span className={cn(
+                        "px-2 py-1 text-xs font-medium rounded-full",
+                        member.memberType === 'STEWARD' ? "bg-amber-100 text-amber-700" : "bg-blue-100 text-blue-700"
+                      )}>
+                        {member.memberType}
+                      </span>
+                    </td>
+                    <td className="py-4 text-sm text-gray-600 dark:text-gray-400">
+                      {branches.find(b => b.id === member.branchId)?.name || 'Main'}
+                    </td>
+                    <td className="py-4">
+                      <span className="flex items-center gap-1.5 text-xs font-medium text-green-600">
+                        <div className="w-1.5 h-1.5 rounded-full bg-green-600"></div>
+                        {member.status}
+                      </span>
+                    </td>
+                    <td className="py-4 text-right">
+                      <button className="p-2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200">
+                        <MoreVertical className="w-4 h-4" />
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </div>
       </div>
-    </div>
-  );
+    );
+  };
+
+  const renderUsers = () => {
+    const filteredUsers = users.filter(u => {
+      if (user?.role === 'SUPER_ADMIN') return true;
+      if (user?.role === 'CHURCH_ADMIN') return u.churchId === user.churchId;
+      if (user?.role === 'BRANCH_ADMIN') return u.branchId === user.branchId;
+      return false;
+    });
+
+    return (
+      <div className="space-y-8">
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-3xl font-bold text-gray-900 dark:text-white">Admin Accounts</h2>
+            <p className="text-gray-500 dark:text-gray-400">Manage church owners, branch leaders, and department heads</p>
+          </div>
+          <button 
+            onClick={() => setIsCreateAdminModalOpen(true)}
+            className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700"
+          >
+            <Plus className="w-4 h-4" />
+            Create Admin
+          </button>
+        </div>
+
+        {isCreateAdminModalOpen && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+            <div className="w-full max-w-md p-8 bg-white rounded-3xl dark:bg-gray-900">
+              <div className="flex items-center justify-between mb-6">
+                <h3 className="text-xl font-bold text-gray-900 dark:text-white">Create Admin Account</h3>
+                <button onClick={() => setIsCreateAdminModalOpen(false)} className="p-2 text-gray-400 hover:text-gray-600">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+              <form className="space-y-4" onSubmit={async (e) => {
+                e.preventDefault();
+                const formData = new FormData(e.currentTarget);
+                const email = formData.get('email') as string;
+                const fullName = formData.get('fullName') as string;
+                const role = formData.get('role') as Role;
+                const churchId = formData.get('churchId') as string;
+                const branchId = formData.get('branchId') as string;
+                const departmentId = formData.get('departmentId') as string;
+
+                try {
+                  // Check if email already exists
+                  const q = query(collection(db, 'users'), where('email', '==', email));
+                  const snapshot = await getDocs(q);
+                  if (!snapshot.empty) {
+                    toast.error('A user with this email already exists');
+                    return;
+                  }
+
+                  await addDoc(collection(db, 'users'), {
+                    email,
+                    fullName,
+                    role,
+                    churchId: churchId || null,
+                    branchId: branchId || null,
+                    departmentId: departmentId || null,
+                    status: 'PENDING',
+                    createdAt: new Date().toISOString(),
+                  });
+                  toast.success('Admin account pre-created! They can now sign in with this email.');
+                  setIsCreateAdminModalOpen(false);
+                } catch (err) {
+                  handleFirestoreError(err, OperationType.CREATE, 'users');
+                }
+              }}>
+                <div>
+                  <label className="block mb-1 text-sm font-medium text-gray-700 dark:text-gray-300">Full Name</label>
+                  <input name="fullName" required className="w-full px-4 py-2 bg-gray-50 border border-gray-200 rounded-xl dark:bg-gray-800 dark:border-gray-700 dark:text-white" />
+                </div>
+                <div>
+                  <label className="block mb-1 text-sm font-medium text-gray-700 dark:text-gray-300">Email Address</label>
+                  <input name="email" type="email" required className="w-full px-4 py-2 bg-gray-50 border border-gray-200 rounded-xl dark:bg-gray-800 dark:border-gray-700 dark:text-white" />
+                </div>
+                <div>
+                  <label className="block mb-1 text-sm font-medium text-gray-700 dark:text-gray-300">Role</label>
+                  <select name="role" required className="w-full px-4 py-2 bg-gray-50 border border-gray-200 rounded-xl dark:bg-gray-800 dark:border-gray-700 dark:text-white">
+                    <option value="CHURCH_ADMIN">Church Admin</option>
+                    <option value="BRANCH_ADMIN">Branch Admin</option>
+                    <option value="DEPT_HEAD">Dept Head</option>
+                  </select>
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block mb-1 text-sm font-medium text-gray-700 dark:text-gray-300">Church (Optional)</label>
+                    <select name="churchId" className="w-full px-4 py-2 bg-gray-50 border border-gray-200 rounded-xl dark:bg-gray-800 dark:border-gray-700 dark:text-white">
+                      <option value="">None</option>
+                      {churches.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block mb-1 text-sm font-medium text-gray-700 dark:text-gray-300">Branch (Optional)</label>
+                    <select name="branchId" className="w-full px-4 py-2 bg-gray-50 border border-gray-200 rounded-xl dark:bg-gray-800 dark:border-gray-700 dark:text-white">
+                      <option value="">None</option>
+                      {branches.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
+                    </select>
+                  </div>
+                </div>
+                <button type="submit" className="w-full py-3 font-bold text-white bg-blue-600 rounded-xl hover:bg-blue-700">
+                  Create Admin Account
+                </button>
+              </form>
+            </div>
+          </div>
+        )}
+
+        <div className="p-6 bg-white border border-gray-100 rounded-2xl dark:bg-gray-900 dark:border-gray-800">
+          <div className="overflow-x-auto">
+            <table className="w-full text-left">
+              <thead>
+                <tr className="border-b border-gray-100 dark:border-gray-800">
+                  <th className="pb-4 text-xs font-semibold text-gray-500 uppercase">User</th>
+                  <th className="pb-4 text-xs font-semibold text-gray-500 uppercase">Role</th>
+                  <th className="pb-4 text-xs font-semibold text-gray-500 uppercase">Scope</th>
+                  <th className="pb-4 text-xs font-semibold text-gray-500 uppercase text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100 dark:divide-gray-800">
+                {filteredUsers.map((u) => (
+                  <tr key={u.id} className="group hover:bg-gray-50 dark:hover:bg-gray-800/50">
+                    <td className="py-4">
+                      <div className="flex items-center gap-3">
+                        <div className="w-8 h-8 bg-blue-100 rounded-full flex items-center justify-center text-blue-600 font-bold">
+                          {u.fullName[0]}
+                        </div>
+                        <div>
+                          <p className="font-medium text-gray-900 dark:text-white">{u.fullName}</p>
+                          <p className="text-xs text-gray-500">{u.email}</p>
+                        </div>
+                      </div>
+                    </td>
+                    <td className="py-4">
+                      <select 
+                        value={u.role}
+                        onChange={async (e) => {
+                          const newRole = e.target.value as Role;
+                          await setDoc(doc(db, 'users', u.id), { role: newRole }, { merge: true });
+                          toast.success('Role updated');
+                        }}
+                        className="text-xs bg-gray-50 border border-gray-200 rounded px-2 py-1 dark:bg-gray-800 dark:border-gray-700 dark:text-white"
+                      >
+                        <option value="SUPER_ADMIN">Super Admin</option>
+                        <option value="CHURCH_ADMIN">Church Admin</option>
+                        <option value="BRANCH_ADMIN">Branch Admin</option>
+                        <option value="DEPT_HEAD">Dept Head</option>
+                        <option value="STEWARD">Steward</option>
+                      </select>
+                    </td>
+                    <td className="py-4 text-sm text-gray-600 dark:text-gray-400">
+                      <div className="flex flex-col gap-2">
+                        {u.role === 'CHURCH_ADMIN' && (
+                          <select
+                            value={u.churchId || ''}
+                            onChange={async (e) => {
+                              await setDoc(doc(db, 'users', u.id), { churchId: e.target.value }, { merge: true });
+                              toast.success('Church assigned');
+                            }}
+                            className="text-xs bg-gray-50 border border-gray-200 rounded px-2 py-1 dark:bg-gray-800 dark:border-gray-700 dark:text-white"
+                          >
+                            <option value="">Select Church</option>
+                            {churches.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                          </select>
+                        )}
+                        {u.role === 'BRANCH_ADMIN' && (
+                          <select
+                            value={u.branchId || ''}
+                            onChange={async (e) => {
+                              await setDoc(doc(db, 'users', u.id), { branchId: e.target.value }, { merge: true });
+                              toast.success('Branch assigned');
+                            }}
+                            className="text-xs bg-gray-50 border border-gray-200 rounded px-2 py-1 dark:bg-gray-800 dark:border-gray-700 dark:text-white"
+                          >
+                            <option value="">Select Branch</option>
+                            {branches.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
+                          </select>
+                        )}
+                        {u.role === 'DEPT_HEAD' && (
+                          <select
+                            value={u.departmentId || ''}
+                            onChange={async (e) => {
+                              await setDoc(doc(db, 'users', u.id), { departmentId: e.target.value }, { merge: true });
+                              toast.success('Department assigned');
+                            }}
+                            className="text-xs bg-gray-50 border border-gray-200 rounded px-2 py-1 dark:bg-gray-800 dark:border-gray-700 dark:text-white"
+                          >
+                            <option value="">Select Dept</option>
+                            {departments.map(d => <option key={d.id} value={d.id}>{d.name} ({branches.find(b => b.id === d.branchId)?.name})</option>)}
+                          </select>
+                        )}
+                        {u.role === 'SUPER_ADMIN' && 'Global Access'}
+                        {u.role === 'STEWARD' && 'No Admin Scope'}
+                      </div>
+                    </td>
+                    <td className="py-4 text-right">
+                      <button className="p-2 text-gray-400 hover:text-gray-600">
+                        <MoreVertical className="w-4 h-4" />
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    );
+  };
 
   return (
     <AuthContext.Provider value={{ user, firebaseUser, loading, signIn, logout }}>
@@ -516,6 +949,9 @@ export default function App() {
           <nav className="flex-1 space-y-1">
             <SidebarItem icon={LayoutDashboard} label="Dashboard" active={activeTab === 'dashboard'} onClick={() => setActiveTab('dashboard')} />
             <SidebarItem icon={Users} label="Members" active={activeTab === 'members'} onClick={() => setActiveTab('members')} />
+            {(user.role === 'SUPER_ADMIN' || user.role === 'CHURCH_ADMIN' || user.role === 'BRANCH_ADMIN') && (
+              <SidebarItem icon={UserCheck} label="Admins" active={activeTab === 'users'} onClick={() => setActiveTab('users')} />
+            )}
             <SidebarItem icon={MapPin} label="Branches" active={activeTab === 'branches'} onClick={() => setActiveTab('branches')} />
             <SidebarItem icon={Building2} label="Departments" active={activeTab === 'departments'} onClick={() => setActiveTab('departments')} />
             <SidebarItem icon={ClipboardList} label="Attendance" active={activeTab === 'attendance'} onClick={() => setActiveTab('attendance')} />
@@ -571,6 +1007,7 @@ export default function App() {
             >
               {activeTab === 'dashboard' && renderDashboard()}
               {activeTab === 'members' && renderMembers()}
+              {activeTab === 'users' && renderUsers()}
               {activeTab === 'branches' && (
                 <div className="space-y-8">
                   <div className="flex items-center justify-between">
@@ -751,7 +1188,7 @@ export default function App() {
                     </div>
                     <div className="p-6 bg-white border border-gray-100 rounded-2xl dark:bg-gray-900 dark:border-gray-800">
                       <h3 className="mb-4 text-lg font-bold text-gray-900 dark:text-white">User Preferences</h3>
-                      <div className="flex items-center justify-between">
+                      <div className="flex items-center justify-between mb-6">
                         <div>
                           <p className="font-medium text-gray-900 dark:text-white">Dark Mode</p>
                           <p className="text-sm text-gray-500">Enable dark theme for the interface</p>
@@ -763,6 +1200,24 @@ export default function App() {
                           <div className="absolute top-1 left-1 w-4 h-4 bg-white rounded-full transition-transform dark:translate-x-6"></div>
                         </button>
                       </div>
+
+                      {user.role === 'SUPER_ADMIN' && (
+                        <div className="pt-6 border-t border-gray-100 dark:border-gray-800">
+                          <h4 className="text-sm font-bold text-red-600 uppercase mb-4">Danger Zone</h4>
+                          <div className="flex items-center justify-between">
+                            <div>
+                              <p className="font-medium text-gray-900 dark:text-white">Seed Demo Data</p>
+                              <p className="text-sm text-gray-500">Populate the database with realistic figures for testing</p>
+                            </div>
+                            <button 
+                              onClick={seedDemoData}
+                              className="px-4 py-2 text-sm font-medium text-white bg-red-600 rounded-lg hover:bg-red-700"
+                            >
+                              Seed Data
+                            </button>
+                          </div>
+                        </div>
+                      )}
                     </div>
                   </div>
                 </div>
